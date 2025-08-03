@@ -1,0 +1,59 @@
+.status-indicator {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: white;
+  font-weight: 500;
+}
+
+.status-dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  animation: pulse 2s infinite;
+}
+
+.status-icon {
+  font-size: 8px;
+  line-height: 1;
+}
+
+.status-text {
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+.status-error {
+  background: rgba(244, 67, 54, 0.2);
+  color: #ffcdd2;
+  padding: 0.25rem 0.5rem;
+  border-radius: 4px;
+  font-size: 0.8rem;
+  margin-left: 0.5rem;
+  border: 1px solid rgba(244, 67, 54, 0.3);
+}
+
+@keyframes pulse {
+  0% { opacity: 1; }
+  50% { opacity: 0.7; }
+  100% { opacity: 1; }
+}
+
+/* Responsive design */
+@media (max-width: 768px) {
+  .status-indicator {
+    flex-direction: column;
+    gap: 0.25rem;
+    align-items: center;
+  }
+
+  .status-error {
+    margin-left: 0;
+    margin-top: 0.25rem;
+    text-align: center;
+  }
+} 
