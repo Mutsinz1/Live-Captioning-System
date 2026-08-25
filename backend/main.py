@@ -87,36 +87,69 @@ async def websocket_audio_endpoint(websocket: WebSocket):
     try:
         # Initialize transcription session for this client
         await transcription_service.start_session(client_id)
-        
+
         while True:
-            # Receive audio data from client
-            data = await websocket.receive_bytes()
-            
-            # Process audio chunk and get transcription
-            try:
-                transcription_result = await transcription_service.process_audio(
-                    client_id, data
-                )
-                
-                if transcription_result:
-                    # Send transcription back to client
-                    response = {
-                        "type": "transcription",
-                        "text": transcription_result["text"],
-                        "is_final": transcription_result["is_final"],
-                        "confidence": transcription_result.get("confidence", 0.0),
-                        "timestamp": transcription_result.get("timestamp")
+            # The audio socket carries binary audio frames AND per-client JSON
+            # control messages (e.g. language changes), so the change applies
+            # to THIS client's session only.
+            message = await websocket.receive()
+
+            if message.get("type") == "websocket.disconnect":
+                raise WebSocketDisconnect(message.get("code", 1000))
+
+            if message.get("bytes") is not None:
+                # Process audio chunk and get transcription
+                try:
+                    transcription_result = await transcription_service.process_audio(
+                        client_id, message["bytes"]
+                    )
+
+                    if transcription_result:
+                        # Send transcription back to client
+                        response = {
+                            "type": "transcription",
+                            "text": transcription_result["text"],
+                            "is_final": transcription_result["is_final"],
+                            "confidence": transcription_result.get("confidence", 0.0),
+                            "timestamp": transcription_result.get("timestamp")
+                        }
+
+                        await websocket.send_text(json.dumps(response))
+
+                except Exception as e:
+                    logger.error(f"Error processing audio for client {client_id}: {e}")
+                    error_response = {
+                        "type": "error",
+                        "message": "Failed to process audio"
                     }
-                    
-                    await websocket.send_text(json.dumps(response))
-                    
-            except Exception as e:
-                logger.error(f"Error processing audio for client {client_id}: {e}")
-                error_response = {
-                    "type": "error",
-                    "message": "Failed to process audio"
-                }
-                await websocket.send_text(json.dumps(error_response))
+                    await websocket.send_text(json.dumps(error_response))
+
+            elif message.get("text") is not None:
+                # Per-client control message
+                try:
+                    control = json.loads(message["text"])
+                except json.JSONDecodeError:
+                    continue
+
+                if control.get("type") == "change_language":
+                    language = control.get("language", "en")
+                    try:
+                        await transcription_service.set_session_language(
+                            client_id, language
+                        )
+                        await websocket.send_text(json.dumps({
+                            "type": "language_changed",
+                            "language": language
+                        }))
+                    except Exception as e:
+                        logger.error(
+                            f"Language change failed for client {client_id}: {e}"
+                        )
+                        await websocket.send_text(json.dumps({
+                            "type": "error",
+                            "message": f"Failed to switch language to '{language}'. "
+                                       "Is the model downloaded?"
+                        }))
                 
     except WebSocketDisconnect:
         logger.info(f"Client {client_id} disconnected")
