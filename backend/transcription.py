@@ -8,6 +8,8 @@ import numpy as np
 from vosk import Model, KaldiRecognizer
 import wave
 
+from formatting import format_caption, formatting_enabled
+
 logger = logging.getLogger(__name__)
 
 class TranscriptionService:
@@ -163,6 +165,9 @@ class TranscriptionService:
                     else:
                         confidence = 0.0
 
+                    if formatting_enabled():
+                        text = format_caption(text, is_final=True)
+
                     transcription = {
                         "text": text,
                         "is_final": True,
@@ -179,8 +184,11 @@ class TranscriptionService:
                 # Partial result
                 result = json.loads(recognizer.PartialResult())
                 text = result.get("partial", "").strip()
-                
+
                 if text:
+                    if formatting_enabled():
+                        text = format_caption(text, is_final=False)
+
                     return {
                         "text": text,
                         "is_final": False,
