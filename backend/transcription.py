@@ -73,7 +73,10 @@ class TranscriptionService:
             raise FileNotFoundError(f"Model not found. Please download {model_name}")
         
         try:
-            self.model = Model(model_path)
+            # Model loading reads hundreds of MB from disk — keep it off the
+            # event loop so health checks and other clients stay responsive.
+            loop = asyncio.get_running_loop()
+            self.model = await loop.run_in_executor(None, Model, model_path)
             self.current_language = language
             self.model_path = model_path
             logger.info(f"Loaded model for language: {language}")
@@ -90,12 +93,12 @@ class TranscriptionService:
             
             # Create recognizer for this client
             recognizer = KaldiRecognizer(self.model, self.sample_rate)
+            recognizer.SetWords(True)  # Enable word-level results for real confidence scores
             self.recognizers[client_id] = recognizer
-            
+
             # Initialize session data
             self.sessions[client_id] = {
                 "start_time": time.time(),
-                "audio_chunks": [],
                 "transcriptions": [],
                 "language": self.current_language
             }
@@ -130,32 +133,41 @@ class TranscriptionService:
                 return None
             
             recognizer = self.recognizers[client_id]
-            
-            # Convert audio data to numpy array
-            audio_array = np.frombuffer(audio_data, dtype=np.int16)
-            
-            # Store audio chunk for potential replay/debugging
-            self.sessions[client_id]["audio_chunks"].append(audio_array)
-            
-            # Process audio with Vosk
-            if recognizer.AcceptWaveform(audio_data):
+
+            # Vosk's AcceptWaveform is CPU-heavy and synchronous — run it in a
+            # thread so one client's audio doesn't block the event loop for all
+            # other connected clients.
+            loop = asyncio.get_running_loop()
+            accepted = await loop.run_in_executor(
+                None, recognizer.AcceptWaveform, audio_data
+            )
+
+            if accepted:
                 # Final result
                 result = json.loads(recognizer.Result())
                 text = result.get("text", "").strip()
-                
+
                 if text:
+                    # With SetWords(True), Vosk returns per-word confidence in
+                    # result["result"]; average it for a caption-level score.
+                    words = result.get("result", [])
+                    if words:
+                        confidence = sum(w.get("conf", 0.0) for w in words) / len(words)
+                    else:
+                        confidence = 0.0
+
                     transcription = {
                         "text": text,
                         "is_final": True,
-                        "confidence": result.get("confidence", 0.0),
+                        "confidence": confidence,
                         "timestamp": time.time()
                     }
-                    
+
                     # Store transcription
                     self.sessions[client_id]["transcriptions"].append(transcription)
-                    
+
                     return transcription
-                    
+
             else:
                 # Partial result
                 result = json.loads(recognizer.PartialResult())
@@ -186,7 +198,9 @@ class TranscriptionService:
                 
                 # Recreate recognizer with new model
                 if client_id in self.recognizers:
-                    self.recognizers[client_id] = KaldiRecognizer(self.model, self.sample_rate)
+                    recognizer = KaldiRecognizer(self.model, self.sample_rate)
+                    recognizer.SetWords(True)
+                    self.recognizers[client_id] = recognizer
             
             logger.info(f"Changed language to {language}")
             
