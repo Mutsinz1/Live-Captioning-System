@@ -29,7 +29,9 @@ export const useTranscription = () => {
   const audioContextRef = useRef(null);
   const sourceRef = useRef(null);
   const analyserRef = useRef(null);
-  const processorRef = useRef(null);
+  const workletNodeRef = useRef(null);
+  const sinkRef = useRef(null);
+  const processorRef = useRef(null); // ScriptProcessor fallback for old browsers
   const animationFrameRef = useRef(null);
   const reconnectTimeoutRef = useRef(null);
   const reconnectAttemptsRef = useRef(0);
@@ -172,7 +174,10 @@ export const useTranscription = () => {
       });
       streamRef.current = stream;
 
-      audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+      // Use the device's NATIVE sample rate — browsers (notably Safari) may
+      // ignore a requested 16kHz rate, so we resample to 16kHz ourselves in
+      // the audio worklet instead of trusting the context rate.
+      audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
       sourceRef.current = audioContextRef.current.createMediaStreamSource(stream);
       analyserRef.current = audioContextRef.current.createAnalyser();
       analyserRef.current.fftSize = 256;
@@ -198,20 +203,58 @@ export const useTranscription = () => {
         await audioContextRef.current.resume();
       }
 
-      const processor = audioContextRef.current.createScriptProcessor(4096, 1, 1);
-      processorRef.current = processor;
-      processor.onaudioprocess = (e) => {
-        if (wsRef.current?.readyState !== WebSocket.OPEN) return;
-        const input = e.inputBuffer.getChannelData(0);
-        const pcm = new Int16Array(input.length);
-        for (let i = 0; i < input.length; i++) {
-          let s = Math.max(-1, Math.min(1, input[i]));
-          pcm[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-        }
-        wsRef.current.send(pcm.buffer);
-      };
-      sourceRef.current.connect(processor);
-      processor.connect(audioContextRef.current.destination);
+      const ctx = audioContextRef.current;
+      if (ctx.audioWorklet) {
+        // Modern path: AudioWorklet runs off the main thread and resamples
+        // from the context's native rate down to 16kHz.
+        await ctx.audioWorklet.addModule(`${process.env.PUBLIC_URL || ''}/pcm-worklet.js`);
+        const node = new AudioWorkletNode(ctx, 'pcm-worklet', {
+          numberOfInputs: 1,
+          numberOfOutputs: 1,
+          processorOptions: { targetSampleRate: 16000 }
+        });
+        node.port.onmessage = (e) => {
+          if (wsRef.current?.readyState === WebSocket.OPEN) {
+            wsRef.current.send(e.data);
+          }
+        };
+        workletNodeRef.current = node;
+
+        // Keep the graph alive without producing audible output
+        const sink = ctx.createGain();
+        sink.gain.value = 0;
+        sinkRef.current = sink;
+
+        sourceRef.current.connect(node);
+        node.connect(sink);
+        sink.connect(ctx.destination);
+      } else {
+        // Fallback for browsers without AudioWorklet: deprecated
+        // ScriptProcessorNode with inline linear-interpolation resampling.
+        const ratio = ctx.sampleRate / 16000;
+        let pos = 0;
+        const processor = ctx.createScriptProcessor(4096, 1, 1);
+        processorRef.current = processor;
+        processor.onaudioprocess = (e) => {
+          if (wsRef.current?.readyState !== WebSocket.OPEN) return;
+          const input = e.inputBuffer.getChannelData(0);
+          const n = input.length;
+          const out = [];
+          while (pos < n) {
+            const i = Math.floor(pos);
+            const frac = pos - i;
+            const s0 = input[i];
+            const s1 = i + 1 < n ? input[i + 1] : input[n - 1];
+            const s = Math.max(-1, Math.min(1, s0 + (s1 - s0) * frac));
+            out.push(s < 0 ? s * 0x8000 : s * 0x7FFF);
+            pos += ratio;
+          }
+          pos -= n;
+          wsRef.current.send(new Int16Array(out).buffer);
+        };
+        sourceRef.current.connect(processor);
+        processor.connect(ctx.destination);
+      }
 
       if (recordingStartRef.current === null) {
         recordingStartRef.current = Date.now() / 1000;
@@ -225,6 +268,18 @@ export const useTranscription = () => {
   const stopTranscription = useCallback(() => {
     // Only tear down the processing chain; keep the stream and analyser alive
     // so the level meter continues working and permission isn't re-requested.
+    if (workletNodeRef.current) {
+      if (sourceRef.current) {
+        try { sourceRef.current.disconnect(workletNodeRef.current); } catch (e) { /* already disconnected */ }
+      }
+      workletNodeRef.current.port.onmessage = null;
+      workletNodeRef.current.disconnect();
+      workletNodeRef.current = null;
+    }
+    if (sinkRef.current) {
+      sinkRef.current.disconnect();
+      sinkRef.current = null;
+    }
     if (processorRef.current) {
       if (sourceRef.current) {
         try { sourceRef.current.disconnect(processorRef.current); } catch (e) { /* already disconnected */ }
@@ -310,6 +365,8 @@ export const useTranscription = () => {
       if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
       if (wsRef.current) wsRef.current.close();
       if (controlWsRef.current) controlWsRef.current.close();
+      if (workletNodeRef.current) workletNodeRef.current.disconnect();
+      if (sinkRef.current) sinkRef.current.disconnect();
       if (processorRef.current) processorRef.current.disconnect();
       if (audioContextRef.current) audioContextRef.current.close();
       if (streamRef.current) {
