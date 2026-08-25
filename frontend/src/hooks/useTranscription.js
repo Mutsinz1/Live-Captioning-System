@@ -137,11 +137,13 @@ export const useTranscription = () => {
   }, []);
 
   const changeLanguage = useCallback((language) => {
-    if (controlWsRef.current?.readyState === WebSocket.OPEN) {
-      controlWsRef.current.send(JSON.stringify({
-        type: 'change_language',
-        language
-      }));
+    const message = JSON.stringify({ type: 'change_language', language });
+    // Prefer the audio socket: the backend maps it to THIS client's session,
+    // so other connected users keep their own language.
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(message);
+    } else if (controlWsRef.current?.readyState === WebSocket.OPEN) {
+      controlWsRef.current.send(message);
     } else {
       pendingLanguageRef.current = language;
       connectControlWebSocket();

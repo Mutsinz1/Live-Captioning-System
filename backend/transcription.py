@@ -14,11 +14,10 @@ class TranscriptionService:
     """Service for handling real-time speech transcription using Vosk"""
     
     def __init__(self):
-        self.model: Optional[Model] = None
+        self.models: Dict[str, Model] = {}  # language -> loaded model (cached)
         self.recognizers: Dict[int, KaldiRecognizer] = {}
         self.sessions: Dict[int, Dict[str, Any]] = {}
-        self.current_language = "en"
-        self.model_path = None
+        self.default_language = "en"
         self.sample_rate = 16000
         self.chunk_size = 8000  # 0.5 seconds at 16kHz
         
@@ -48,59 +47,67 @@ class TranscriptionService:
             model_dir = os.path.join(os.path.dirname(__file__), "models")
             os.makedirs(model_dir, exist_ok=True)
             
-            # Load default English model
-            await self.load_model("en")
+            # Load the default language model
+            await self.load_model(self.default_language)
             logger.info("Transcription service initialized successfully")
             
         except Exception as e:
             logger.error(f"Failed to initialize transcription service: {e}")
             raise
     
-    async def load_model(self, language: str):
-        """Load a Vosk model for the specified language"""
+    async def load_model(self, language: str) -> Model:
+        """Load (or fetch from cache) the Vosk model for a language"""
         if language not in self.available_models:
             raise ValueError(f"Language {language} not supported")
-        
+
+        # Cached — no disk I/O, no reload
+        if language in self.models:
+            return self.models[language]
+
         model_info = self.available_models[language]
         model_name = model_info["name"]
         model_path = os.path.join(os.path.dirname(__file__), "models", model_name)
-        
+
         # Check if model exists, if not, provide instructions
         if not os.path.exists(model_path):
             logger.warning(f"Model {model_name} not found at {model_path}")
             logger.info(f"Please download the model from: {model_info['url']}")
             logger.info(f"Extract it to: {model_path}")
             raise FileNotFoundError(f"Model not found. Please download {model_name}")
-        
+
         try:
             # Model loading reads hundreds of MB from disk — keep it off the
             # event loop so health checks and other clients stay responsive.
             loop = asyncio.get_running_loop()
-            self.model = await loop.run_in_executor(None, Model, model_path)
-            self.current_language = language
-            self.model_path = model_path
+            model = await loop.run_in_executor(None, Model, model_path)
+            self.models[language] = model
             logger.info(f"Loaded model for language: {language}")
-            
+            return model
+
         except Exception as e:
             logger.error(f"Failed to load model for language {language}: {e}")
             raise
+
+    def _make_recognizer(self, model: Model) -> KaldiRecognizer:
+        """Create a recognizer with word-level results enabled"""
+        recognizer = KaldiRecognizer(model, self.sample_rate)
+        recognizer.SetWords(True)
+        return recognizer
     
-    async def start_session(self, client_id: int):
+    async def start_session(self, client_id: int, language: Optional[str] = None):
         """Start a new transcription session for a client"""
         try:
-            if self.model is None:
-                raise RuntimeError("No model loaded")
-            
+            lang = language or self.default_language
+            model = await self.load_model(lang)
+
             # Create recognizer for this client
-            recognizer = KaldiRecognizer(self.model, self.sample_rate)
-            recognizer.SetWords(True)  # Enable word-level results for real confidence scores
-            self.recognizers[client_id] = recognizer
+            self.recognizers[client_id] = self._make_recognizer(model)
 
             # Initialize session data
             self.sessions[client_id] = {
                 "start_time": time.time(),
                 "transcriptions": [],
-                "language": self.current_language
+                "language": lang
             }
             
             logger.info(f"Started transcription session for client {client_id}")
@@ -187,23 +194,38 @@ class TranscriptionService:
             logger.error(f"Error processing audio for client {client_id}: {e}")
             return None
     
+    async def set_session_language(self, client_id: int, language: str):
+        """Change the transcription language for ONE client's session"""
+        try:
+            if client_id not in self.sessions:
+                raise KeyError(f"No session for client {client_id}")
+
+            model = await self.load_model(language)
+            self.sessions[client_id]["language"] = language
+            self.recognizers[client_id] = self._make_recognizer(model)
+            logger.info(f"Client {client_id} language changed to {language}")
+
+        except Exception as e:
+            logger.error(
+                f"Failed to change language to {language} for client {client_id}: {e}"
+            )
+            raise
+
     async def change_language(self, language: str):
-        """Change the transcription language"""
+        """Change the default language and switch all active sessions to it.
+
+        Kept for the global /ws/control channel; per-client changes should use
+        set_session_language instead.
+        """
         try:
             await self.load_model(language)
-            
-            # Update all active sessions
-            for client_id in self.sessions:
-                self.sessions[client_id]["language"] = language
-                
-                # Recreate recognizer with new model
-                if client_id in self.recognizers:
-                    recognizer = KaldiRecognizer(self.model, self.sample_rate)
-                    recognizer.SetWords(True)
-                    self.recognizers[client_id] = recognizer
-            
-            logger.info(f"Changed language to {language}")
-            
+            self.default_language = language
+
+            for client_id in list(self.sessions):
+                await self.set_session_language(client_id, language)
+
+            logger.info(f"Default language changed to {language}")
+
         except Exception as e:
             logger.error(f"Failed to change language to {language}: {e}")
             raise
@@ -228,9 +250,12 @@ class TranscriptionService:
     async def get_status(self) -> Dict[str, Any]:
         """Get current service status"""
         return {
-            "current_language": self.current_language,
-            "model_loaded": self.model is not None,
+            "default_language": self.default_language,
+            "loaded_languages": sorted(self.models.keys()),
             "active_sessions": len(self.sessions),
+            "session_languages": {
+                str(cid): s["language"] for cid, s in self.sessions.items()
+            },
             "sample_rate": self.sample_rate
         }
     
@@ -246,7 +271,7 @@ class TranscriptionService:
         try:
             self.recognizers.clear()
             self.sessions.clear()
-            self.model = None
+            self.models.clear()
             logger.info("Transcription service cleaned up")
             
         except Exception as e:
