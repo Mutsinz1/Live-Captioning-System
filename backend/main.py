@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 from typing import Dict, Set
 
 import uvicorn  # type: ignore
@@ -20,10 +21,20 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Live Captioning API", version="1.0.0")
 
-# CORS middleware for frontend communication
+# CORS middleware for frontend communication.
+# Override with a comma-separated CORS_ORIGINS env var when deploying behind
+# a proxy or on a non-localhost host, e.g.:
+#   CORS_ORIGINS=https://captions.example.com,http://localhost:3000
+cors_origins = [
+    origin.strip()
+    for origin in os.environ.get(
+        "CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000"
+    ).split(",")
+    if origin.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
