@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+from contextlib import asynccontextmanager
 from typing import Dict, Set
 
 import uvicorn  # type: ignore
@@ -19,7 +20,26 @@ from transcription import TranscriptionService
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Live Captioning API", version="1.0.0")
+# Global state
+active_connections: Set[WebSocket] = set()
+transcription_service = TranscriptionService()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup/shutdown lifecycle (replaces deprecated @app.on_event)"""
+    try:
+        await transcription_service.initialize()
+        logger.info("Transcription service initialized successfully")
+    except Exception as e:
+        logger.error(f"Failed to initialize transcription service: {e}")
+        raise
+    yield
+    await transcription_service.cleanup()
+    logger.info("Transcription service cleaned up")
+
+
+app = FastAPI(title="Live Captioning API", version="1.0.0", lifespan=lifespan)
 
 # CORS middleware for frontend communication.
 # Override with a comma-separated CORS_ORIGINS env var when deploying behind
@@ -39,26 +59,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Global state
-active_connections: Set[WebSocket] = set()
-transcription_service = TranscriptionService()
-
-@app.on_event("startup")
-async def startup_event():
-    """Initialize transcription service on startup"""
-    try:
-        await transcription_service.initialize()
-        logger.info("Transcription service initialized successfully")
-    except Exception as e:
-        logger.error(f"Failed to initialize transcription service: {e}")
-        raise
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Cleanup on shutdown"""
-    await transcription_service.cleanup()
-    logger.info("Transcription service cleaned up")
 
 @app.get("/health")
 async def health_check():
