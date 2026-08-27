@@ -23,7 +23,7 @@ jobs:
         working-directory: backend
         run: |
           pip install -r requirements.txt
-          pip install pytest
+          pip install pytest httpx  # httpx backs fastapi's TestClient
 
       - name: Run tests
         working-directory: backend
@@ -51,6 +51,4 @@ jobs:
 
       - name: Build
         working-directory: frontend
-        env:
-          CI: "false" # CRA treats lint warnings as errors when CI=true
         run: npm run build

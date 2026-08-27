@@ -68,7 +68,9 @@ function App() {
         return;
       }
 
-      if (e.code === 'Space') {
+      // Space alone toggles recording; with a modifier held it belongs to the
+      // browser (or to the shortcuts below), so leave it alone.
+      if (e.code === 'Space' && !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey) {
         e.preventDefault();
         if (isRecording) {
           handleStopRecording();
