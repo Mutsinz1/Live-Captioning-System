@@ -128,7 +128,21 @@ async def websocket_audio_endpoint(websocket: WebSocket):
                 except json.JSONDecodeError:
                     continue
 
-                if control.get("type") == "change_language":
+                if control.get("type") == "stop_recording":
+                    # Vosk only finalises on detected silence, so a client that
+                    # stops mid-utterance would leave its last sentence as a
+                    # partial — and exports only include final captions.
+                    final = await transcription_service.flush(client_id)
+                    if final:
+                        await websocket.send_text(json.dumps({
+                            "type": "transcription",
+                            "text": final["text"],
+                            "is_final": True,
+                            "confidence": final["confidence"],
+                            "timestamp": final["timestamp"],
+                        }))
+
+                elif control.get("type") == "change_language":
                     language = control.get("language", "en")
                     try:
                         await transcription_service.set_session_language(

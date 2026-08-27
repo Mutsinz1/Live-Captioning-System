@@ -136,3 +136,33 @@ def test_detect_silence_uses_normalised_scale(service):
     assert detect_silence(loud) is False
     assert detect_silence(b"") is True
     assert detect_silence(b"\x00") is False  # not a whole int16 sample
+
+
+def test_flush_finalises_the_trailing_utterance(service):
+    """Vosk finalises on silence; stopping mid-sentence must not lose it."""
+    async def scenario():
+        await service.initialize()
+        await service.start_session(1)
+        rec = service.recognizers[1]
+        rec.mode = "partial"
+
+        partial = await service.process_audio(1, b"\x00\x00" * 100)
+        assert partial["is_final"] is False
+        assert not service.sessions[1]["transcriptions"]
+
+        final = await service.flush(1)
+        assert final is not None
+        assert final["is_final"] is True
+        assert final["text"] == "Hello world"
+        assert abs(final["confidence"] - 0.8) < 1e-9
+        assert len(service.sessions[1]["transcriptions"]) == 1
+
+    run(scenario())
+
+
+def test_flush_without_a_session_is_harmless(service):
+    async def scenario():
+        await service.initialize()
+        assert await service.flush(999) is None
+
+    run(scenario())

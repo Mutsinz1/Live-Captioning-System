@@ -284,6 +284,13 @@ export const useTranscription = () => {
   }, [requestPermission]);
 
   const stopTranscription = useCallback(() => {
+    // Ask the backend to finalise the trailing utterance. Vosk only emits a
+    // final result on detected silence, so stopping mid-sentence would leave
+    // the last thing said as a partial — and exports keep only finals.
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: 'stop_recording' }));
+    }
+
     // Only tear down the processing chain; keep the stream and analyser alive
     // so the level meter continues working and permission isn't re-requested.
     if (workletNodeRef.current) {

@@ -138,3 +138,17 @@ def test_status_reports_live_sessions(client):
             status = ctl.receive_json()["status"]
     assert status["active_sessions"] == 1
     assert status["sample_rate"] == 16000
+
+
+def test_stop_recording_flushes_the_last_utterance(client):
+    """Regression: without this the final sentence never reaches the export."""
+    with client.websocket_connect("/ws/audio") as ws:
+        ws.send_bytes(b"\x00\x00" * 100)          # arrives as a partial
+        assert ws.receive_json()["is_final"] is False
+
+        ws.send_text(json.dumps({"type": "stop_recording"}))
+        final = ws.receive_json()
+
+    assert final["type"] == "transcription"
+    assert final["is_final"] is True
+    assert final["text"] == "Hello world"

@@ -51,6 +51,10 @@ class FakeRecognizer:
     def PartialResult(self):
         return json.dumps(self.partial_payload)
 
+    def FinalResult(self):
+        """Vosk flushes any buffered audio and returns a final result."""
+        return json.dumps(self.final_payload)
+
 
 # Stub vosk BEFORE any test imports transcription
 fake_vosk = types.ModuleType("vosk")
