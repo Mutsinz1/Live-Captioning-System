@@ -30,7 +30,7 @@ jobs:
         run: pytest tests/ -v
 
   frontend:
-    name: Frontend build
+    name: Frontend tests + build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -44,6 +44,10 @@ jobs:
       - name: Install dependencies
         working-directory: frontend
         run: npm ci
+
+      - name: Run tests
+        working-directory: frontend
+        run: npm test -- --ci
 
       - name: Build
         working-directory: frontend
