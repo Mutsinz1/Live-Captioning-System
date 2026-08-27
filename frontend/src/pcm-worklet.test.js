@@ -60,9 +60,11 @@ describe.each([[48000], [44100], [16000]])('resampling %ikHz to 16kHz', (inRate)
   test('emits the expected number of samples (no cumulative drift)', () => {
     const { got, input } = run(inRate);
     const expected = (input.length * 16000) / inRate;
-    // up to one un-flushed 2048-sample chunk may still be buffered
+    // Shortfall is bounded by one partly-filled chunk (at most CHUNK - 1 =
+    // 2047 samples still buffered) plus the single input sample the worklet
+    // skips at stream start, so 2048 is reachable exactly (e.g. at ratio 1).
     expect(expected - got.length).toBeGreaterThanOrEqual(0);
-    expect(expected - got.length).toBeLessThan(2048);
+    expect(expected - got.length).toBeLessThanOrEqual(2048);
   });
 
   test('matches a boundary-free resampler', () => {
