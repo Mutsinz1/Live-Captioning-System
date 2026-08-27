@@ -24,7 +24,6 @@ export const useTranscription = () => {
 
   const wsRef = useRef(null);
   const controlWsRef = useRef(null);
-  const pendingLanguageRef = useRef(null);
   const streamRef = useRef(null);
   const audioContextRef = useRef(null);
   const sourceRef = useRef(null);
@@ -36,6 +35,8 @@ export const useTranscription = () => {
   const reconnectTimeoutRef = useRef(null);
   const reconnectAttemptsRef = useRef(0);
   const recordingStartRef = useRef(null);
+  const isUnmountedRef = useRef(false);
+  const languageRef = useRef(null);
   const maxReconnectAttempts = 5;
 
   const connectWebSocket = useCallback(() => {
@@ -46,6 +47,14 @@ export const useTranscription = () => {
         setIsConnected(true);
         setError(null);
         reconnectAttemptsRef.current = 0;
+        // A reconnect starts a fresh backend session at the default language,
+        // so re-assert this client's choice.
+        if (languageRef.current) {
+          wsRef.current.send(JSON.stringify({
+            type: 'change_language',
+            language: languageRef.current
+          }));
+        }
       };
 
       wsRef.current.onmessage = (event) => {
@@ -59,7 +68,11 @@ export const useTranscription = () => {
                 text: data.text,
                 is_final: data.is_final,
                 confidence: data.confidence,
-                timestamp: data.timestamp
+                timestamp: data.timestamp,
+                // data.timestamp comes from the server clock. Subtitle timing
+                // must not depend on client/server clocks agreeing, so stamp
+                // arrival on the same clock recordingStartRef uses.
+                receivedAt: Date.now() / 1000
               };
               // Replace the trailing partial caption in place; otherwise append
               if (lastIndex >= 0 && !newCaptions[lastIndex].is_final) {
@@ -79,6 +92,9 @@ export const useTranscription = () => {
 
       wsRef.current.onclose = () => {
         setIsConnected(false);
+        // close() during unmount still fires onclose; without this guard the
+        // handler schedules a reconnect for a component that is already gone.
+        if (isUnmountedRef.current) return;
         if (reconnectAttemptsRef.current < maxReconnectAttempts) {
           reconnectAttemptsRef.current++;
           const delay = Math.min(1000 * Math.pow(2, reconnectAttemptsRef.current), 10000);
@@ -103,14 +119,8 @@ export const useTranscription = () => {
       controlWsRef.current = new WebSocket(`${getWsBase()}/ws/control`);
 
       controlWsRef.current.onopen = () => {
-        // Flush a language change requested while the socket was down
-        if (pendingLanguageRef.current) {
-          controlWsRef.current.send(JSON.stringify({
-            type: 'change_language',
-            language: pendingLanguageRef.current
-          }));
-          pendingLanguageRef.current = null;
-        }
+        // Status/settings channel only. Language is per-session and travels
+        // over the audio socket instead.
       };
 
       controlWsRef.current.onmessage = (event) => {
@@ -137,18 +147,15 @@ export const useTranscription = () => {
   }, []);
 
   const changeLanguage = useCallback((language) => {
-    const message = JSON.stringify({ type: 'change_language', language });
-    // Prefer the audio socket: the backend maps it to THIS client's session,
-    // so other connected users keep their own language.
+    // Language is per-session state, so it only ever travels over the audio
+    // socket. The control channel sets the server-wide default, which would
+    // change what every other connected user is transcribed as.
+    languageRef.current = language;
     if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(message);
-    } else if (controlWsRef.current?.readyState === WebSocket.OPEN) {
-      controlWsRef.current.send(message);
-    } else {
-      pendingLanguageRef.current = language;
-      connectControlWebSocket();
+      wsRef.current.send(JSON.stringify({ type: 'change_language', language }));
     }
-  }, [connectControlWebSocket]);
+    // Otherwise onopen replays languageRef once the socket connects.
+  }, []);
 
   const updateAudioLevel = useCallback(() => {
     if (!analyserRef.current) return;
@@ -234,7 +241,8 @@ export const useTranscription = () => {
         // Fallback for browsers without AudioWorklet: deprecated
         // ScriptProcessorNode with inline linear-interpolation resampling.
         const ratio = ctx.sampleRate / 16000;
-        let pos = 0;
+        let pos = 1;
+        let prev = 0;
         const processor = ctx.createScriptProcessor(4096, 1, 1);
         processorRef.current = processor;
         processor.onaudioprocess = (e) => {
@@ -242,17 +250,21 @@ export const useTranscription = () => {
           const input = e.inputBuffer.getChannelData(0);
           const n = input.length;
           const out = [];
+          // Same virtual-buffer scheme as pcm-worklet.js: index 0 is the
+          // previous block's last sample, so interpolation always has both
+          // neighbours instead of reusing the block's final sample.
           while (pos < n) {
             const i = Math.floor(pos);
             const frac = pos - i;
-            const s0 = input[i];
-            const s1 = i + 1 < n ? input[i + 1] : input[n - 1];
+            const s0 = i === 0 ? prev : input[i - 1];
+            const s1 = input[i];
             const s = Math.max(-1, Math.min(1, s0 + (s1 - s0) * frac));
             out.push(s < 0 ? s * 0x8000 : s * 0x7FFF);
             pos += ratio;
           }
           pos -= n;
-          wsRef.current.send(new Int16Array(out).buffer);
+          prev = input[n - 1];
+          if (out.length) wsRef.current.send(new Int16Array(out).buffer);
         };
         sourceRef.current.connect(processor);
         processor.connect(ctx.destination);
@@ -302,8 +314,10 @@ export const useTranscription = () => {
     if (finalCaptions.length === 0) return;
 
     // Subtitle times must be relative to the start of the recording, not
-    // wall-clock epoch time. Fall back to the first caption's timestamp.
-    const base = recordingStartRef.current ?? finalCaptions[0].timestamp;
+    // wall-clock epoch time, and must come from ONE clock: receivedAt and
+    // recordingStartRef are both browser-side, unlike the server timestamp.
+    const cueTime = (caption) => caption.receivedAt ?? caption.timestamp;
+    const base = recordingStartRef.current ?? cueTime(finalCaptions[0]);
 
     // Format seconds as HH:MM:SS<sep>mmm
     const formatTime = (totalSeconds, msSeparator) => {
@@ -318,9 +332,9 @@ export const useTranscription = () => {
     // Derive cue timings: each cue starts at its (relative) timestamp and ends
     // at the next cue's start, clamped to a sane 1–7 second range.
     const cues = finalCaptions.map((caption, index) => {
-      const start = Math.max(0, caption.timestamp - base);
+      const start = Math.max(0, cueTime(caption) - base);
       const next = finalCaptions[index + 1];
-      let duration = next ? next.timestamp - caption.timestamp : 2;
+      let duration = next ? cueTime(next) - cueTime(caption) : 2;
       duration = Math.min(Math.max(duration, 1), 7);
       return { text: caption.text, start, end: start + duration };
     });
@@ -360,9 +374,11 @@ export const useTranscription = () => {
   }, [captions]);
 
   useEffect(() => {
+    isUnmountedRef.current = false;
     connectWebSocket();
     connectControlWebSocket();
     return () => {
+      isUnmountedRef.current = true;
       if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
       if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
       if (wsRef.current) wsRef.current.close();
