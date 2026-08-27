@@ -3,12 +3,17 @@ import json
 import logging
 import os
 import time
+from collections import deque
 from typing import Dict, List, Optional, Any
 import numpy as np
 from vosk import Model, KaldiRecognizer
-import wave
 
 from formatting import format_caption, formatting_enabled
+
+# Cap on transcriptions retained per session. A caption every few seconds over
+# a multi-hour session would otherwise grow without bound; the client keeps the
+# authoritative transcript for export.
+MAX_SESSION_TRANSCRIPTIONS = int(os.environ.get("MAX_SESSION_TRANSCRIPTIONS", "10000"))
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +22,9 @@ class TranscriptionService:
     
     def __init__(self):
         self.models: Dict[str, Model] = {}  # language -> loaded model (cached)
+        # One lock per language so concurrent first-use of the same model
+        # loads it once instead of every caller reading it from disk.
+        self._model_locks: Dict[str, asyncio.Lock] = {}
         self.recognizers: Dict[int, KaldiRecognizer] = {}
         self.sessions: Dict[int, Dict[str, Any]] = {}
         self.default_language = "en"
@@ -66,6 +74,14 @@ class TranscriptionService:
         if language in self.models:
             return self.models[language]
 
+        lock = self._model_locks.setdefault(language, asyncio.Lock())
+        async with lock:
+            # Another caller may have loaded it while we waited for the lock.
+            if language in self.models:
+                return self.models[language]
+            return await self._load_model_locked(language)
+
+    async def _load_model_locked(self, language: str) -> Model:
         model_info = self.available_models[language]
         model_name = model_info["name"]
         model_path = os.path.join(os.path.dirname(__file__), "models", model_name)
@@ -108,7 +124,7 @@ class TranscriptionService:
             # Initialize session data
             self.sessions[client_id] = {
                 "start_time": time.time(),
-                "transcriptions": [],
+                "transcriptions": deque(maxlen=MAX_SESSION_TRANSCRIPTIONS),
                 "language": lang
             }
             
@@ -165,8 +181,15 @@ class TranscriptionService:
                     else:
                         confidence = 0.0
 
+                    session = self.sessions.get(client_id)
                     if formatting_enabled():
-                        text = format_caption(text, is_final=True)
+                        text = format_caption(
+                            text,
+                            language=session["language"] if session else "en",
+                            # Vosk segments on silence, not sentence ends, so
+                            # only the very first caption starts a sentence.
+                            is_sentence_start=not (session and session["transcriptions"]),
+                        )
 
                     transcription = {
                         "text": text,
@@ -175,8 +198,10 @@ class TranscriptionService:
                         "timestamp": time.time()
                     }
 
-                    # Store transcription
-                    self.sessions[client_id]["transcriptions"].append(transcription)
+                    # Store transcription (session may have ended while the
+                    # recognizer ran in the executor)
+                    if session is not None:
+                        session["transcriptions"].append(transcription)
 
                     return transcription
 
@@ -186,8 +211,13 @@ class TranscriptionService:
                 text = result.get("partial", "").strip()
 
                 if text:
+                    session = self.sessions.get(client_id)
                     if formatting_enabled():
-                        text = format_caption(text, is_final=False)
+                        text = format_caption(
+                            text,
+                            language=session["language"] if session else "en",
+                            is_sentence_start=not (session and session["transcriptions"]),
+                        )
 
                     return {
                         "text": text,
@@ -270,7 +300,7 @@ class TranscriptionService:
         if client_id not in self.sessions:
             return []
         
-        return self.sessions[client_id]["transcriptions"]
+        return list(self.sessions[client_id]["transcriptions"])
     
     async def cleanup(self):
         """Clean up resources"""

@@ -1,9 +1,8 @@
-import asyncio
 import json
 import logging
 import os
 from contextlib import asynccontextmanager
-from typing import Dict, Set
+from typing import Set
 
 import uvicorn  # type: ignore
 
@@ -11,8 +10,6 @@ import uvicorn  # type: ignore
 # type: ignore
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException  # type: ignore
 from fastapi.middleware.cors import CORSMiddleware  # type: ignore
-from fastapi.responses import JSONResponse  # type: ignore
-import numpy as np
 
 from transcription import TranscriptionService
 
@@ -170,8 +167,13 @@ async def websocket_control_endpoint(websocket: WebSocket):
         while True:
             # Receive control messages from client
             data = await websocket.receive_text()
-            message = json.loads(data)
-            
+            try:
+                message = json.loads(data)
+            except json.JSONDecodeError:
+                # A malformed frame should not tear down the control channel
+                logger.warning("Ignoring malformed control message")
+                continue
+
             if message.get("type") == "change_language":
                 language = message.get("language", "en")
                 await transcription_service.change_language(language)

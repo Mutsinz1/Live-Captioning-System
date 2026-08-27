@@ -157,6 +157,8 @@ export const useTranscription = () => {
     // Otherwise onopen replays languageRef once the socket connects.
   }, []);
 
+  // The level meter is live UI, so this loop runs while the mic is open; the
+  // guard just stops a second loop being started alongside the first.
   const updateAudioLevel = useCallback(() => {
     if (!analyserRef.current) return;
     const dataArray = new Uint8Array(analyserRef.current.frequencyBinCount);
@@ -191,7 +193,9 @@ export const useTranscription = () => {
       analyserRef.current = audioContextRef.current.createAnalyser();
       analyserRef.current.fftSize = 256;
       sourceRef.current.connect(analyserRef.current);
-      updateAudioLevel();
+      if (animationFrameRef.current === null) {
+        updateAudioLevel();
+      }
 
       setHasPermission(true);
       return stream;

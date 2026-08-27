@@ -4,8 +4,9 @@
   "description": "Real-time live captioning frontend",
   "private": true,
   "dependencies": {
+    "@testing-library/dom": "^10.4.1",
     "@testing-library/jest-dom": "^5.16.4",
-    "@testing-library/react": "^13.3.0",
+    "@testing-library/react": "^16.3.3",
     "@testing-library/user-event": "^13.5.0",
     "ajv": "^8.17.1",
     "react": "^18.2.0",
