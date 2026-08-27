@@ -220,22 +220,20 @@ class TranscriptionService:
             raise
 
     async def change_language(self, language: str):
-        """Change the default language and switch all active sessions to it.
+        """Set the DEFAULT language that NEW sessions start in.
 
-        Kept for the global /ws/control channel; per-client changes should use
-        set_session_language instead.
+        Exposed on the global /ws/control channel. It deliberately leaves
+        already-running sessions alone: language is per-client state (see
+        set_session_language), so rewriting live sessions from here would
+        switch every other connected user's captions mid-stream.
         """
         try:
             await self.load_model(language)
             self.default_language = language
-
-            for client_id in list(self.sessions):
-                await self.set_session_language(client_id, language)
-
-            logger.info(f"Default language changed to {language}")
+            logger.info(f"Default language for new sessions changed to {language}")
 
         except Exception as e:
-            logger.error(f"Failed to change language to {language}: {e}")
+            logger.error(f"Failed to change default language to {language}: {e}")
             raise
     
     async def get_available_models(self) -> List[Dict[str, str]]:
@@ -292,10 +290,19 @@ def convert_audio_format(audio_data: bytes, from_format: str, to_format: str) ->
     return audio_data
 
 def detect_silence(audio_data: bytes, threshold: float = 0.01) -> bool:
-    """Detect if audio chunk is mostly silence"""
+    """Detect if an audio chunk is mostly silence.
+
+    threshold is on the normalised -1.0..1.0 scale, so int16 samples must be
+    scaled before comparing. Measuring RMS on raw int16 (peak 32768) against a
+    0.01 threshold made this return False for everything but digital silence.
+    """
     try:
         audio_array = np.frombuffer(audio_data, dtype=np.int16)
-        rms = np.sqrt(np.mean(audio_array.astype(np.float32) ** 2))
+        if audio_array.size == 0:
+            return True
+        normalized = audio_array.astype(np.float32) / 32768.0
+        rms = float(np.sqrt(np.mean(normalized ** 2)))
         return rms < threshold
-    except:
+    except (ValueError, TypeError):
+        # e.g. a byte count that is not a whole number of int16 samples
         return False 

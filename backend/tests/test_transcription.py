@@ -77,15 +77,23 @@ def test_per_client_language_and_model_cache(service):
     run(scenario())
 
 
-def test_global_change_language_switches_everyone(service):
+def test_control_channel_changes_default_only(service):
+    """The global channel must not rewrite sessions that are already running."""
     async def scenario():
         await service.initialize()
         await service.start_session(1)
         await service.start_session(2, "es")
+        rec1, rec2 = service.recognizers[1], service.recognizers[2]
+
         await service.change_language("fr")
+
         assert service.default_language == "fr"
-        assert service.sessions[1]["language"] == "fr"
-        assert service.sessions[2]["language"] == "fr"
+        # live sessions keep their own language and their own recognizer
+        assert service.sessions[1]["language"] == "en"
+        assert service.sessions[2]["language"] == "es"
+        assert service.recognizers[1] is rec1
+        assert service.recognizers[2] is rec2
+        # only new sessions pick up the new default
         await service.start_session(3)
         assert service.sessions[3]["language"] == "fr"
 
@@ -114,3 +122,17 @@ def test_status_reports_sessions(service):
         assert status["active_sessions"] == 2
 
     run(scenario())
+
+
+def test_detect_silence_uses_normalised_scale(service):
+    """Silence detection compares against a -1.0..1.0 threshold, not raw int16."""
+    import numpy as np
+    from transcription import detect_silence
+
+    quiet = (np.full(1000, 100, dtype=np.int16)).tobytes()   # ~0.003 normalised
+    loud = (np.full(1000, 20000, dtype=np.int16)).tobytes()  # ~0.61 normalised
+
+    assert detect_silence(quiet) is True
+    assert detect_silence(loud) is False
+    assert detect_silence(b"") is True
+    assert detect_silence(b"\x00") is False  # not a whole int16 sample
