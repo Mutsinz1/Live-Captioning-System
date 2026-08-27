@@ -154,3 +154,22 @@ test('still reconnects while mounted', () => {
   expect(sockets.filter(s => s.url.endsWith('/ws/audio'))).toHaveLength(2);
   jest.useRealTimers();
 });
+
+test('stopping asks the backend to finalise the trailing utterance', async () => {
+  const { result } = renderHook(() => useTranscription());
+  const ws = audioSocket();
+  ws.readyState = 1;
+  await act(async () => { await result.current.startTranscription(); });
+  ws.sent.length = 0;
+
+  act(() => { result.current.stopTranscription(); });
+
+  // Vosk only finalises on silence, so without this the last sentence stays
+  // a partial and never reaches the export (which keeps finals only).
+  expect(ws.sent.map(JSON.parse)).toContainEqual({ type: 'stop_recording' });
+});
+
+test('stopping while disconnected does not throw', () => {
+  const { result } = renderHook(() => useTranscription());
+  expect(() => act(() => { result.current.stopTranscription(); })).not.toThrow();
+});

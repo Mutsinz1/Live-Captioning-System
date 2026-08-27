@@ -169,41 +169,7 @@ class TranscriptionService:
 
             if accepted:
                 # Final result
-                result = json.loads(recognizer.Result())
-                text = result.get("text", "").strip()
-
-                if text:
-                    # With SetWords(True), Vosk returns per-word confidence in
-                    # result["result"]; average it for a caption-level score.
-                    words = result.get("result", [])
-                    if words:
-                        confidence = sum(w.get("conf", 0.0) for w in words) / len(words)
-                    else:
-                        confidence = 0.0
-
-                    session = self.sessions.get(client_id)
-                    if formatting_enabled():
-                        text = format_caption(
-                            text,
-                            language=session["language"] if session else "en",
-                            # Vosk segments on silence, not sentence ends, so
-                            # only the very first caption starts a sentence.
-                            is_sentence_start=not (session and session["transcriptions"]),
-                        )
-
-                    transcription = {
-                        "text": text,
-                        "is_final": True,
-                        "confidence": confidence,
-                        "timestamp": time.time()
-                    }
-
-                    # Store transcription (session may have ended while the
-                    # recognizer ran in the executor)
-                    if session is not None:
-                        session["transcriptions"].append(transcription)
-
-                    return transcription
+                return self._build_final(client_id, json.loads(recognizer.Result()))
 
             else:
                 # Partial result
@@ -232,6 +198,58 @@ class TranscriptionService:
             logger.error(f"Error processing audio for client {client_id}: {e}")
             return None
     
+    def _build_final(
+        self, client_id: int, result: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """Turn a Vosk final result into a caption, storing it on the session."""
+        text = result.get("text", "").strip()
+        if not text:
+            return None
+
+        # With SetWords(True), Vosk returns per-word confidence in
+        # result["result"]; average it for a caption-level score.
+        words = result.get("result", [])
+        confidence = (
+            sum(w.get("conf", 0.0) for w in words) / len(words) if words else 0.0
+        )
+
+        # The session may have ended while the recognizer ran in the executor.
+        session = self.sessions.get(client_id)
+        if formatting_enabled():
+            text = format_caption(
+                text,
+                language=session["language"] if session else "en",
+                # Vosk segments on silence, not sentence ends, so only the
+                # very first caption starts a sentence.
+                is_sentence_start=not (session and session["transcriptions"]),
+            )
+
+        transcription = {
+            "text": text,
+            "is_final": True,
+            "confidence": confidence,
+            "timestamp": time.time(),
+        }
+        if session is not None:
+            session["transcriptions"].append(transcription)
+        return transcription
+
+    async def flush(self, client_id: int) -> Optional[Dict[str, Any]]:
+        """Finalise whatever audio the recognizer is still holding.
+
+        Vosk only emits a final result once it detects silence, so a client
+        that stops recording mid-utterance would otherwise leave its last
+        sentence as a partial forever — and exports only include final
+        captions, so that sentence would be missing from the transcript.
+        """
+        if client_id not in self.recognizers:
+            return None
+
+        recognizer = self.recognizers[client_id]
+        loop = asyncio.get_running_loop()
+        raw = await loop.run_in_executor(None, recognizer.FinalResult)
+        return self._build_final(client_id, json.loads(raw))
+
     async def set_session_language(self, client_id: int, language: str):
         """Change the transcription language for ONE client's session"""
         try:
