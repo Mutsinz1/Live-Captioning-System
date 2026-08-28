@@ -1,0 +1,12 @@
+# Keep the build context small: Dockerfile.fly only needs source files.
+.git
+**/node_modules
+backend/venv
+backend/models
+frontend/build
+**/__pycache__
+**/*.pyc
+.DS_Store
+**/.DS_Store
+* 2.*
+**/* 2.*
