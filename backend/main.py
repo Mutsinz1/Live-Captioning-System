@@ -114,7 +114,10 @@ async def websocket_audio_endpoint(websocket: WebSocket):
                         await websocket.send_text(json.dumps(response))
 
                 except Exception as e:
-                    logger.error(f"Error processing audio for client {client_id}: {e}")
+                    # repr(): some disconnect errors stringify to nothing at all
+                    logger.error(
+                        "Error processing audio for client %s: %r", client_id, e
+                    )
                     error_response = {
                         "type": "error",
                         "message": "Failed to process audio"
