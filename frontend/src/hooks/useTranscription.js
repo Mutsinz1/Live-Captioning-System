@@ -41,23 +41,31 @@ export const useTranscription = () => {
 
   const connectWebSocket = useCallback(() => {
     try {
-      wsRef.current = new WebSocket(`${getWsBase()}/ws/audio`);
+      // Bind handlers to THIS socket. React 18 StrictMode mounts, unmounts and
+      // remounts in development, so a superseded socket can still emit events
+      // (notably a late onclose) — those must not touch state owned by the
+      // socket that replaced it.
+      const ws = new WebSocket(`${getWsBase()}/ws/audio`);
+      const isCurrent = () => wsRef.current === ws;
+      wsRef.current = ws;
 
-      wsRef.current.onopen = () => {
+      ws.onopen = () => {
+        if (!isCurrent()) return;
         setIsConnected(true);
         setError(null);
         reconnectAttemptsRef.current = 0;
         // A reconnect starts a fresh backend session at the default language,
         // so re-assert this client's choice.
         if (languageRef.current) {
-          wsRef.current.send(JSON.stringify({
+          ws.send(JSON.stringify({
             type: 'change_language',
             language: languageRef.current
           }));
         }
       };
 
-      wsRef.current.onmessage = (event) => {
+      ws.onmessage = (event) => {
+        if (!isCurrent()) return;
         try {
           const data = JSON.parse(event.data);
           if (data.type === 'transcription') {
@@ -90,7 +98,8 @@ export const useTranscription = () => {
         }
       };
 
-      wsRef.current.onclose = () => {
+      ws.onclose = () => {
+        if (!isCurrent()) return;
         setIsConnected(false);
         // close() during unmount still fires onclose; without this guard the
         // handler schedules a reconnect for a component that is already gone.
@@ -106,7 +115,8 @@ export const useTranscription = () => {
         }
       };
 
-      wsRef.current.onerror = () => {
+      ws.onerror = () => {
+        if (!isCurrent()) return;
         setError('Connection error. Please check if the backend service is running.');
       };
     } catch (err) {
@@ -116,14 +126,17 @@ export const useTranscription = () => {
 
   const connectControlWebSocket = useCallback(() => {
     try {
-      controlWsRef.current = new WebSocket(`${getWsBase()}/ws/control`);
+      const ctlWs = new WebSocket(`${getWsBase()}/ws/control`);
+      const ctlIsCurrent = () => controlWsRef.current === ctlWs;
+      controlWsRef.current = ctlWs;
 
-      controlWsRef.current.onopen = () => {
+      ctlWs.onopen = () => {
         // Status/settings channel only. Language is per-session and travels
         // over the audio socket instead.
       };
 
-      controlWsRef.current.onmessage = (event) => {
+      ctlWs.onmessage = (event) => {
+        if (!ctlIsCurrent()) return;
         try {
           const data = JSON.parse(event.data);
           if (data.type === 'error') {
@@ -134,11 +147,12 @@ export const useTranscription = () => {
         }
       };
 
-      controlWsRef.current.onclose = () => {
+      ctlWs.onclose = () => {
+        if (!ctlIsCurrent()) return;
         controlWsRef.current = null;
       };
 
-      controlWsRef.current.onerror = () => {
+      ctlWs.onerror = () => {
         // Non-fatal: transcription still works without the control channel
       };
     } catch (err) {
