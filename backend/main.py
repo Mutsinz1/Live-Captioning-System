@@ -10,6 +10,7 @@ import uvicorn  # type: ignore
 # type: ignore
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException  # type: ignore
 from fastapi.middleware.cors import CORSMiddleware  # type: ignore
+from fastapi.staticfiles import StaticFiles  # type: ignore
 
 from transcription import TranscriptionService
 
@@ -206,6 +207,18 @@ async def websocket_control_endpoint(websocket: WebSocket):
         logger.info("Control client disconnected")
     except Exception as e:
         logger.error(f"Control WebSocket error: {e}")
+
+# Serve the built frontend from the same origin when a bundle is present
+# (single-container deployments, e.g. Fly.io). Registered after every API
+# route so /health, /models and the websockets take precedence; the frontend
+# resolves the websocket base to the same origin in this layout, so no CORS
+# or REACT_APP_WS_URL configuration is needed.
+static_dir = os.environ.get(
+    "STATIC_DIR", os.path.join(os.path.dirname(__file__), "static")
+)
+if os.path.isdir(static_dir):
+    app.mount("/", StaticFiles(directory=static_dir, html=True), name="frontend")
+    logger.info(f"Serving frontend from {static_dir}")
 
 if __name__ == "__main__":
     uvicorn.run(

@@ -1,0 +1,39 @@
+# Single-container image for Fly.io: builds the React frontend, downloads the
+# Vosk models, and serves everything from the FastAPI backend on one origin.
+# (docker-compose continues to use backend/Dockerfile and frontend/Dockerfile.)
+
+# --- Stage 1: frontend build ---
+FROM node:20-alpine AS frontend
+WORKDIR /build
+COPY frontend/package*.json ./
+RUN npm ci --no-audit --no-fund
+COPY frontend/ ./
+# No REACT_APP_WS_URL: the app is served from the backend's origin, and
+# getWsBase() falls back to same-origin websockets.
+RUN npm run build
+
+# --- Stage 2: speech models ---
+FROM alpine:3.20 AS models
+RUN apk add --no-cache curl unzip
+WORKDIR /models
+RUN for m in vosk-model-small-en-us-0.15 vosk-model-small-es-0.42 vosk-model-small-fr-0.22; do \
+      curl -sSL -o "$m.zip" "https://alphacephei.com/vosk/models/$m.zip" && \
+      unzip -q "$m.zip" && rm "$m.zip"; \
+    done
+
+# --- Stage 3: runtime ---
+FROM python:3.12-slim
+RUN apt-get update && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY backend/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY backend/ .
+COPY --from=models /models ./models
+COPY --from=frontend /build/build ./static
+
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
