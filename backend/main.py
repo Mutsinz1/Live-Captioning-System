@@ -1,7 +1,8 @@
-import asyncio
 import json
 import logging
-from typing import Dict, Set
+import os
+from contextlib import asynccontextmanager
+from typing import Set
 
 import uvicorn  # type: ignore
 
@@ -9,8 +10,6 @@ import uvicorn  # type: ignore
 # type: ignore
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException  # type: ignore
 from fastapi.middleware.cors import CORSMiddleware  # type: ignore
-from fastapi.responses import JSONResponse  # type: ignore
-import numpy as np
 
 from transcription import TranscriptionService
 
@@ -18,36 +17,45 @@ from transcription import TranscriptionService
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Live Captioning API", version="1.0.0")
-
-# CORS middleware for frontend communication
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 # Global state
 active_connections: Set[WebSocket] = set()
 transcription_service = TranscriptionService()
 
-@app.on_event("startup")
-async def startup_event():
-    """Initialize transcription service on startup"""
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup/shutdown lifecycle (replaces deprecated @app.on_event)"""
     try:
         await transcription_service.initialize()
         logger.info("Transcription service initialized successfully")
     except Exception as e:
         logger.error(f"Failed to initialize transcription service: {e}")
         raise
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Cleanup on shutdown"""
+    yield
     await transcription_service.cleanup()
     logger.info("Transcription service cleaned up")
+
+
+app = FastAPI(title="Live Captioning API", version="1.0.0", lifespan=lifespan)
+
+# CORS middleware for frontend communication.
+# Override with a comma-separated CORS_ORIGINS env var when deploying behind
+# a proxy or on a non-localhost host, e.g.:
+#   CORS_ORIGINS=https://captions.example.com,http://localhost:3000
+cors_origins = [
+    origin.strip()
+    for origin in os.environ.get(
+        "CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000"
+    ).split(",")
+    if origin.strip()
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.get("/health")
 async def health_check():
@@ -76,36 +84,83 @@ async def websocket_audio_endpoint(websocket: WebSocket):
     try:
         # Initialize transcription session for this client
         await transcription_service.start_session(client_id)
-        
+
         while True:
-            # Receive audio data from client
-            data = await websocket.receive_bytes()
-            
-            # Process audio chunk and get transcription
-            try:
-                transcription_result = await transcription_service.process_audio(
-                    client_id, data
-                )
-                
-                if transcription_result:
-                    # Send transcription back to client
-                    response = {
-                        "type": "transcription",
-                        "text": transcription_result["text"],
-                        "is_final": transcription_result["is_final"],
-                        "confidence": transcription_result.get("confidence", 0.0),
-                        "timestamp": transcription_result.get("timestamp")
+            # The audio socket carries binary audio frames AND per-client JSON
+            # control messages (e.g. language changes), so the change applies
+            # to THIS client's session only.
+            message = await websocket.receive()
+
+            if message.get("type") == "websocket.disconnect":
+                raise WebSocketDisconnect(message.get("code", 1000))
+
+            if message.get("bytes") is not None:
+                # Process audio chunk and get transcription
+                try:
+                    transcription_result = await transcription_service.process_audio(
+                        client_id, message["bytes"]
+                    )
+
+                    if transcription_result:
+                        # Send transcription back to client
+                        response = {
+                            "type": "transcription",
+                            "text": transcription_result["text"],
+                            "is_final": transcription_result["is_final"],
+                            "confidence": transcription_result.get("confidence", 0.0),
+                            "timestamp": transcription_result.get("timestamp")
+                        }
+
+                        await websocket.send_text(json.dumps(response))
+
+                except Exception as e:
+                    logger.error(f"Error processing audio for client {client_id}: {e}")
+                    error_response = {
+                        "type": "error",
+                        "message": "Failed to process audio"
                     }
-                    
-                    await websocket.send_text(json.dumps(response))
-                    
-            except Exception as e:
-                logger.error(f"Error processing audio for client {client_id}: {e}")
-                error_response = {
-                    "type": "error",
-                    "message": "Failed to process audio"
-                }
-                await websocket.send_text(json.dumps(error_response))
+                    await websocket.send_text(json.dumps(error_response))
+
+            elif message.get("text") is not None:
+                # Per-client control message
+                try:
+                    control = json.loads(message["text"])
+                except json.JSONDecodeError:
+                    continue
+
+                if control.get("type") == "stop_recording":
+                    # Vosk only finalises on detected silence, so a client that
+                    # stops mid-utterance would leave its last sentence as a
+                    # partial — and exports only include final captions.
+                    final = await transcription_service.flush(client_id)
+                    if final:
+                        await websocket.send_text(json.dumps({
+                            "type": "transcription",
+                            "text": final["text"],
+                            "is_final": True,
+                            "confidence": final["confidence"],
+                            "timestamp": final["timestamp"],
+                        }))
+
+                elif control.get("type") == "change_language":
+                    language = control.get("language", "en")
+                    try:
+                        await transcription_service.set_session_language(
+                            client_id, language
+                        )
+                        await websocket.send_text(json.dumps({
+                            "type": "language_changed",
+                            "language": language
+                        }))
+                    except Exception as e:
+                        logger.error(
+                            f"Language change failed for client {client_id}: {e}"
+                        )
+                        await websocket.send_text(json.dumps({
+                            "type": "error",
+                            "message": f"Failed to switch language to '{language}'. "
+                                       "Is the model downloaded?"
+                        }))
                 
     except WebSocketDisconnect:
         logger.info(f"Client {client_id} disconnected")
@@ -126,8 +181,13 @@ async def websocket_control_endpoint(websocket: WebSocket):
         while True:
             # Receive control messages from client
             data = await websocket.receive_text()
-            message = json.loads(data)
-            
+            try:
+                message = json.loads(data)
+            except json.JSONDecodeError:
+                # A malformed frame should not tear down the control channel
+                logger.warning("Ignoring malformed control message")
+                continue
+
             if message.get("type") == "change_language":
                 language = message.get("language", "en")
                 await transcription_service.change_language(language)

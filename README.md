@@ -7,21 +7,17 @@ A browser-based real-time speech-to-text captioning system with minimal latency 
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.104+-green.svg)](https://fastapi.tiangolo.com)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-## 🎥 Demo
-
-![Live Captioning Demo](demo.gif)
-
-Try it out: [Live Demo](https://your-demo-url.com)
-
 ## ✨ Features
 
-- 🎤 Real-time microphone audio capture
+- 🎤 Real-time microphone audio capture (AudioWorklet, works at any device sample rate)
 - ⚡ Low-latency live captions (<500ms)
-- 🎯 High accuracy transcription using Vosk
+- 🎯 High accuracy transcription using Vosk — fully offline, no cloud API
+- ✍️ Automatic caption casing and punctuation
 - 🎨 Clean, accessible UI with customizable display
-- 📝 Transcript export (TXT, SRT, VTT)
+- ⌨️ Keyboard shortcuts (Space to record, Ctrl/Cmd+S export, Ctrl/Cmd+L clear)
+- 📝 Transcript export (TXT, SRT, VTT with recording-relative timestamps)
 - 🔄 Automatic reconnection and error handling
-- 🌍 Multi-language support
+- 🌍 Per-client language switching (English, Spanish, French out of the box)
 - 👥 Speaker identification (planned)
 
 ## 🏗️ Architecture
@@ -101,14 +97,19 @@ npm start
 Create a `.env` file in the backend directory:
 
 ```env
-# Backend Configuration
-HOST=0.0.0.0
-PORT=8000
-LOG_LEVEL=info
+# Comma-separated origins allowed by CORS (default: localhost:3000)
+CORS_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
 
-# Vosk Configuration
-VOSK_MODEL_PATH=./models/vosk-model-small-en-us-0.15
-SAMPLE_RATE=16000
+# Set to "false" to disable automatic caption casing/punctuation
+FORMAT_CAPTIONS=true
+```
+
+Frontend (set at build time):
+
+```env
+# Override the WebSocket endpoint. If unset: port 3000 (CRA dev) talks to
+# localhost:8000 directly; any other origin uses same-host /ws/ (nginx proxy).
+REACT_APP_WS_URL=wss://captions.example.com
 ```
 
 ### Customization
@@ -139,8 +140,8 @@ SAMPLE_RATE=16000
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/ws/audio` | WebSocket | Real-time audio streaming and transcription |
-| `/ws/control` | WebSocket | Control messages (language, settings) |
+| `/ws/audio` | WebSocket | Binary audio frames in, transcription JSON out; also accepts per-client JSON control messages (e.g. `change_language`) |
+| `/ws/control` | WebSocket | Global control messages (default language, status) |
 | `/health` | GET | Health check endpoint |
 | `/models` | GET | Available transcription models |
 

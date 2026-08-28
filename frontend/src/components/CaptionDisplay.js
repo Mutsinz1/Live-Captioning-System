@@ -1,6 +1,12 @@
 import React, { useRef, useEffect } from 'react';
 import './CaptionDisplay.css';
 
+// Only the tail of the transcript is rendered. A long session accumulates
+// thousands of captions, and mounting a DOM node for every one of them is
+// what actually degrades the page — the full list stays in state so export
+// still covers the whole session.
+const MAX_RENDERED_CAPTIONS = 300;
+
 const CaptionDisplay = ({ captions, settings }) => {
   const containerRef = useRef(null);
   const liveRegionRef = useRef(null);
@@ -66,7 +72,7 @@ const CaptionDisplay = ({ captions, settings }) => {
             </p>
           </div>
         ) : (
-          captions.map((caption, index) => (
+          captions.slice(-MAX_RENDERED_CAPTIONS).map((caption, index) => (
             <div
               key={`${caption.timestamp}-${index}`}
               className={`caption-item ${caption.is_final ? 'caption-final' : 'caption-partial'}`}
