@@ -3,10 +3,17 @@ import json
 import logging
 import os
 import time
+from collections import deque
 from typing import Dict, List, Optional, Any
 import numpy as np
 from vosk import Model, KaldiRecognizer
-import wave
+
+from formatting import format_caption, formatting_enabled
+
+# Cap on transcriptions retained per session. A caption every few seconds over
+# a multi-hour session would otherwise grow without bound; the client keeps the
+# authoritative transcript for export.
+MAX_SESSION_TRANSCRIPTIONS = int(os.environ.get("MAX_SESSION_TRANSCRIPTIONS", "10000"))
 
 logger = logging.getLogger(__name__)
 
@@ -14,11 +21,13 @@ class TranscriptionService:
     """Service for handling real-time speech transcription using Vosk"""
     
     def __init__(self):
-        self.model: Optional[Model] = None
+        self.models: Dict[str, Model] = {}  # language -> loaded model (cached)
+        # One lock per language so concurrent first-use of the same model
+        # loads it once instead of every caller reading it from disk.
+        self._model_locks: Dict[str, asyncio.Lock] = {}
         self.recognizers: Dict[int, KaldiRecognizer] = {}
         self.sessions: Dict[int, Dict[str, Any]] = {}
-        self.current_language = "en"
-        self.model_path = None
+        self.default_language = "en"
         self.sample_rate = 16000
         self.chunk_size = 8000  # 0.5 seconds at 16kHz
         
@@ -48,56 +57,75 @@ class TranscriptionService:
             model_dir = os.path.join(os.path.dirname(__file__), "models")
             os.makedirs(model_dir, exist_ok=True)
             
-            # Load default English model
-            await self.load_model("en")
+            # Load the default language model
+            await self.load_model(self.default_language)
             logger.info("Transcription service initialized successfully")
             
         except Exception as e:
             logger.error(f"Failed to initialize transcription service: {e}")
             raise
     
-    async def load_model(self, language: str):
-        """Load a Vosk model for the specified language"""
+    async def load_model(self, language: str) -> Model:
+        """Load (or fetch from cache) the Vosk model for a language"""
         if language not in self.available_models:
             raise ValueError(f"Language {language} not supported")
-        
+
+        # Cached — no disk I/O, no reload
+        if language in self.models:
+            return self.models[language]
+
+        lock = self._model_locks.setdefault(language, asyncio.Lock())
+        async with lock:
+            # Another caller may have loaded it while we waited for the lock.
+            if language in self.models:
+                return self.models[language]
+            return await self._load_model_locked(language)
+
+    async def _load_model_locked(self, language: str) -> Model:
         model_info = self.available_models[language]
         model_name = model_info["name"]
         model_path = os.path.join(os.path.dirname(__file__), "models", model_name)
-        
+
         # Check if model exists, if not, provide instructions
         if not os.path.exists(model_path):
             logger.warning(f"Model {model_name} not found at {model_path}")
             logger.info(f"Please download the model from: {model_info['url']}")
             logger.info(f"Extract it to: {model_path}")
             raise FileNotFoundError(f"Model not found. Please download {model_name}")
-        
+
         try:
-            self.model = Model(model_path)
-            self.current_language = language
-            self.model_path = model_path
+            # Model loading reads hundreds of MB from disk — keep it off the
+            # event loop so health checks and other clients stay responsive.
+            loop = asyncio.get_running_loop()
+            model = await loop.run_in_executor(None, Model, model_path)
+            self.models[language] = model
             logger.info(f"Loaded model for language: {language}")
-            
+            return model
+
         except Exception as e:
             logger.error(f"Failed to load model for language {language}: {e}")
             raise
+
+    def _make_recognizer(self, model: Model) -> KaldiRecognizer:
+        """Create a recognizer with word-level results enabled"""
+        recognizer = KaldiRecognizer(model, self.sample_rate)
+        recognizer.SetWords(True)
+        return recognizer
     
-    async def start_session(self, client_id: int):
+    async def start_session(self, client_id: int, language: Optional[str] = None):
         """Start a new transcription session for a client"""
         try:
-            if self.model is None:
-                raise RuntimeError("No model loaded")
-            
+            lang = language or self.default_language
+            model = await self.load_model(lang)
+
             # Create recognizer for this client
-            recognizer = KaldiRecognizer(self.model, self.sample_rate)
-            self.recognizers[client_id] = recognizer
-            
+            self.recognizers[client_id] = self._make_recognizer(model)
+
             # Initialize session data
             self.sessions[client_id] = {
                 "start_time": time.time(),
-                "audio_chunks": [],
-                "transcriptions": [],
-                "language": self.current_language
+                "transcriptions": deque(maxlen=MAX_SESSION_TRANSCRIPTIONS),
+                "language": lang
             }
             
             logger.info(f"Started transcription session for client {client_id}")
@@ -130,38 +158,33 @@ class TranscriptionService:
                 return None
             
             recognizer = self.recognizers[client_id]
-            
-            # Convert audio data to numpy array
-            audio_array = np.frombuffer(audio_data, dtype=np.int16)
-            
-            # Store audio chunk for potential replay/debugging
-            self.sessions[client_id]["audio_chunks"].append(audio_array)
-            
-            # Process audio with Vosk
-            if recognizer.AcceptWaveform(audio_data):
+
+            # Vosk's AcceptWaveform is CPU-heavy and synchronous — run it in a
+            # thread so one client's audio doesn't block the event loop for all
+            # other connected clients.
+            loop = asyncio.get_running_loop()
+            accepted = await loop.run_in_executor(
+                None, recognizer.AcceptWaveform, audio_data
+            )
+
+            if accepted:
                 # Final result
-                result = json.loads(recognizer.Result())
-                text = result.get("text", "").strip()
-                
-                if text:
-                    transcription = {
-                        "text": text,
-                        "is_final": True,
-                        "confidence": result.get("confidence", 0.0),
-                        "timestamp": time.time()
-                    }
-                    
-                    # Store transcription
-                    self.sessions[client_id]["transcriptions"].append(transcription)
-                    
-                    return transcription
-                    
+                return self._build_final(client_id, json.loads(recognizer.Result()))
+
             else:
                 # Partial result
                 result = json.loads(recognizer.PartialResult())
                 text = result.get("partial", "").strip()
-                
+
                 if text:
+                    session = self.sessions.get(client_id)
+                    if formatting_enabled():
+                        text = format_caption(
+                            text,
+                            language=session["language"] if session else "en",
+                            is_sentence_start=not (session and session["transcriptions"]),
+                        )
+
                     return {
                         "text": text,
                         "is_final": False,
@@ -175,23 +198,90 @@ class TranscriptionService:
             logger.error(f"Error processing audio for client {client_id}: {e}")
             return None
     
+    def _build_final(
+        self, client_id: int, result: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """Turn a Vosk final result into a caption, storing it on the session."""
+        text = result.get("text", "").strip()
+        if not text:
+            return None
+
+        # With SetWords(True), Vosk returns per-word confidence in
+        # result["result"]; average it for a caption-level score.
+        words = result.get("result", [])
+        confidence = (
+            sum(w.get("conf", 0.0) for w in words) / len(words) if words else 0.0
+        )
+
+        # The session may have ended while the recognizer ran in the executor.
+        session = self.sessions.get(client_id)
+        if formatting_enabled():
+            text = format_caption(
+                text,
+                language=session["language"] if session else "en",
+                # Vosk segments on silence, not sentence ends, so only the
+                # very first caption starts a sentence.
+                is_sentence_start=not (session and session["transcriptions"]),
+            )
+
+        transcription = {
+            "text": text,
+            "is_final": True,
+            "confidence": confidence,
+            "timestamp": time.time(),
+        }
+        if session is not None:
+            session["transcriptions"].append(transcription)
+        return transcription
+
+    async def flush(self, client_id: int) -> Optional[Dict[str, Any]]:
+        """Finalise whatever audio the recognizer is still holding.
+
+        Vosk only emits a final result once it detects silence, so a client
+        that stops recording mid-utterance would otherwise leave its last
+        sentence as a partial forever — and exports only include final
+        captions, so that sentence would be missing from the transcript.
+        """
+        if client_id not in self.recognizers:
+            return None
+
+        recognizer = self.recognizers[client_id]
+        loop = asyncio.get_running_loop()
+        raw = await loop.run_in_executor(None, recognizer.FinalResult)
+        return self._build_final(client_id, json.loads(raw))
+
+    async def set_session_language(self, client_id: int, language: str):
+        """Change the transcription language for ONE client's session"""
+        try:
+            if client_id not in self.sessions:
+                raise KeyError(f"No session for client {client_id}")
+
+            model = await self.load_model(language)
+            self.sessions[client_id]["language"] = language
+            self.recognizers[client_id] = self._make_recognizer(model)
+            logger.info(f"Client {client_id} language changed to {language}")
+
+        except Exception as e:
+            logger.error(
+                f"Failed to change language to {language} for client {client_id}: {e}"
+            )
+            raise
+
     async def change_language(self, language: str):
-        """Change the transcription language"""
+        """Set the DEFAULT language that NEW sessions start in.
+
+        Exposed on the global /ws/control channel. It deliberately leaves
+        already-running sessions alone: language is per-client state (see
+        set_session_language), so rewriting live sessions from here would
+        switch every other connected user's captions mid-stream.
+        """
         try:
             await self.load_model(language)
-            
-            # Update all active sessions
-            for client_id in self.sessions:
-                self.sessions[client_id]["language"] = language
-                
-                # Recreate recognizer with new model
-                if client_id in self.recognizers:
-                    self.recognizers[client_id] = KaldiRecognizer(self.model, self.sample_rate)
-            
-            logger.info(f"Changed language to {language}")
-            
+            self.default_language = language
+            logger.info(f"Default language for new sessions changed to {language}")
+
         except Exception as e:
-            logger.error(f"Failed to change language to {language}: {e}")
+            logger.error(f"Failed to change default language to {language}: {e}")
             raise
     
     async def get_available_models(self) -> List[Dict[str, str]]:
@@ -214,9 +304,12 @@ class TranscriptionService:
     async def get_status(self) -> Dict[str, Any]:
         """Get current service status"""
         return {
-            "current_language": self.current_language,
-            "model_loaded": self.model is not None,
+            "default_language": self.default_language,
+            "loaded_languages": sorted(self.models.keys()),
             "active_sessions": len(self.sessions),
+            "session_languages": {
+                str(cid): s["language"] for cid, s in self.sessions.items()
+            },
             "sample_rate": self.sample_rate
         }
     
@@ -225,14 +318,14 @@ class TranscriptionService:
         if client_id not in self.sessions:
             return []
         
-        return self.sessions[client_id]["transcriptions"]
+        return list(self.sessions[client_id]["transcriptions"])
     
     async def cleanup(self):
         """Clean up resources"""
         try:
             self.recognizers.clear()
             self.sessions.clear()
-            self.model = None
+            self.models.clear()
             logger.info("Transcription service cleaned up")
             
         except Exception as e:
@@ -245,10 +338,19 @@ def convert_audio_format(audio_data: bytes, from_format: str, to_format: str) ->
     return audio_data
 
 def detect_silence(audio_data: bytes, threshold: float = 0.01) -> bool:
-    """Detect if audio chunk is mostly silence"""
+    """Detect if an audio chunk is mostly silence.
+
+    threshold is on the normalised -1.0..1.0 scale, so int16 samples must be
+    scaled before comparing. Measuring RMS on raw int16 (peak 32768) against a
+    0.01 threshold made this return False for everything but digital silence.
+    """
     try:
         audio_array = np.frombuffer(audio_data, dtype=np.int16)
-        rms = np.sqrt(np.mean(audio_array.astype(np.float32) ** 2))
+        if audio_array.size == 0:
+            return True
+        normalized = audio_array.astype(np.float32) / 32768.0
+        rms = float(np.sqrt(np.mean(normalized ** 2)))
         return rms < threshold
-    except:
+    except (ValueError, TypeError):
+        # e.g. a byte count that is not a whole number of int16 samples
         return False 
