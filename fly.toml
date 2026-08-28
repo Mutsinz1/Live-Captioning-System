@@ -1,0 +1,31 @@
+# Fly.io configuration — single app serving backend + frontend on one origin.
+# Set `app` to the name you choose during `fly launch` (it will fill this in).
+app = "live-captioning"
+primary_region = "iad"   # pick the region closest to your users at launch
+
+[build]
+  dockerfile = "Dockerfile.fly"
+
+[http_service]
+  internal_port = 8000
+  force_https = true            # getUserMedia requires a secure origin
+  # Always-on: never scale to zero, so there is no cold model-load and
+  # websocket connections are never dropped by a suspending machine.
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "20s"
+    method = "GET"
+    path = "/health"
+
+[[vm]]
+  size = "shared-cpu-2x"
+  memory = "2gb"
+
+[env]
+  PYTHONUNBUFFERED = "1"
+  # Same-origin deployment: no CORS_ORIGINS or REACT_APP_WS_URL needed.
