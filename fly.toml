@@ -1,6 +1,6 @@
 # Fly.io configuration — single app serving backend + frontend on one origin.
 # Set `app` to the name you choose during `fly launch` (it will fill this in).
-app = "live-captioning"
+app = "abel-live-captions"
 primary_region = "iad"   # pick the region closest to your users at launch
 
 [build]
